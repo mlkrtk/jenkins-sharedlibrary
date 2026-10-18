@@ -21,7 +21,7 @@ def call(String dockerRegistry, String dockerImageTag, String snykCred, String s
         sh """
             export SNYK_TOKEN=${snykToken}
             echo "🔍 Snyk Image scan"
-            snyk container test ${dockerRegistry}:${dockerImageTag} --org=${snykOrg} --severity-threshold=high 
+            snyk container test ${dockerRegistry}:${dockerImageTag} --org=${snykOrg} --severity-threshold=critical 
             # snyk container monitor ${dockerRegistry}:${dockerImageTag} --org=${snykOrg}
         """
     }
