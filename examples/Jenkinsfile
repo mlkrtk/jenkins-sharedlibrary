@@ -1,0 +1,86 @@
+// Pin the library to a release tag (e.g. 'sharedlibrary@v2.0.0') so library changes can't break builds unannounced.
+@Library('sharedlibrary') _
+
+pipeline {
+    agent { label 'docker' }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '20', artifactNumToKeepStr: '10'))
+        disableConcurrentBuilds()
+        timeout(time: 30, unit: 'MINUTES')
+        timestamps()
+    }
+
+    environment {
+        APP_NAME        = 'tetris'
+        AWS_ACCOUNT_ID  = '891543987898'
+        AWS_REGION      = 'ap-south-1'
+        DOCKER_IMAGE    = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${APP_NAME}"
+        // Docker tags only allow [A-Za-z0-9_.-]: feature/login -> feature-login
+        GIT_BRANCH_NAME = env.GIT_BRANCH.replaceFirst(/^origin\//, '').replaceAll(/[^A-Za-z0-9_.-]/, '-')
+        DOCKER_TAG      = "${GIT_BRANCH_NAME}-${GIT_COMMIT[0..6]}"
+        SNYK_ORG        = 'c7ea86d1-d613-4212-80de-9b38354f5ced'
+
+        MANIFEST_REPO   = 'https://github.com/mlkrtk/argocd-manifests.git'
+        MANIFEST_BRANCH = 'develop'
+        MANIFEST_PATH   = 'develop/tetris/overlays/dev'
+    }
+
+    stages {
+        stage('Snyk Code Scan') {
+            steps {
+                snykCodeScan(snykCredId: 'snykCred', snykOrg: env.SNYK_ORG, severityThreshold: 'high')
+            }
+        }
+
+        stage('Docker Build') {
+            steps {
+                dockerImageBuild(image: env.DOCKER_IMAGE, tag: env.DOCKER_TAG)
+            }
+        }
+
+        stage('Snyk Image Scan') {
+            steps {
+                snykImageScan(image: env.DOCKER_IMAGE, tag: env.DOCKER_TAG,
+                              snykCredId: 'snykCred', snykOrg: env.SNYK_ORG,
+                              severityThreshold: 'critical')
+            }
+        }
+
+        stage('Docker Push') {
+            steps {
+                dockerECRImagePush(image: env.DOCKER_IMAGE, tag: env.DOCKER_TAG,
+                                   region: env.AWS_REGION, awsCredId: 'awsCred')
+            }
+        }
+
+        stage('Update Manifests') {
+            // Only deployable branches open GitOps PRs; feature branches stop after the push.
+            when { expression { env.GIT_BRANCH_NAME in ['main', 'master', 'develop'] } }
+            steps {
+                updateManifestWithPR(
+                    repoUrl:       env.MANIFEST_REPO,
+                    branch:        env.MANIFEST_BRANCH,
+                    gitCredId:     'githubCred',
+                    ghTokenCredId: 'githubToken',
+                    path:          env.MANIFEST_PATH,
+                    image:         env.DOCKER_IMAGE,
+                    tag:           env.DOCKER_TAG,
+                    sourceCommit:  env.GIT_COMMIT
+                )
+                // Direct push instead of a PR (e.g. for dev):
+                // updateManifest(repoUrl: env.MANIFEST_REPO, branch: env.MANIFEST_BRANCH, gitCredId: 'githubCred',
+                //                path: env.MANIFEST_PATH, image: env.DOCKER_IMAGE, tag: env.DOCKER_TAG,
+                //                sourceCommit: env.GIT_COMMIT)
+            }
+        }
+    }
+
+    post {
+        always {
+            // Free agent disk: drop the local image and the workspace.
+            sh 'docker image rm "${DOCKER_IMAGE}:${DOCKER_TAG}" >/dev/null 2>&1 || true'
+            deleteDir()
+        }
+    }
+}

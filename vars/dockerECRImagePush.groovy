@@ -1,40 +1,93 @@
-def call(String dockerRegistry, String dockerImageTag, String ecrRepo, String awsCredID, String awsRegion){
-    sh """
-        if ! command -v aws > /dev/null; then
-            echo "AWS CLI not found. Installing AWS CLI..."
-            curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" 2> /dev/null
-            
-            dpkg-query -l unzip > /dev/null || sudo apt-get update && sudo apt-get -y install unzip
-            
-            unzip awscliv2.zip > /dev/null
-            sudo ./aws/install > /dev/null
-            rm -rf awscliv2.zip aws
-            echo "AWS CLI installed successfully."
-        fi
-    """
+import org.mlkrtk.ci.Shell
+import org.mlkrtk.ci.Tools
 
-    // Use the 'aws' type credentials directly
-    withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: awsCredID]]) {
-        sh """
-            # Configure AWS CLI
-            aws configure set aws_access_key_id \$AWS_ACCESS_KEY_ID
-            aws configure set aws_secret_access_key \$AWS_SECRET_ACCESS_KEY
-            aws configure set region $awsRegion
-
-            # Check if the repository exists and create it if it does not
-            if ! aws ecr describe-repositories --repository-names $ecrRepo --region $awsRegion >/dev/null 2>&1; then
-                echo "Repository $ecrRepo does not exist. Creating repository."
-                aws ecr create-repository --repository-name $ecrRepo --region $awsRegion
-            else
-                echo "Repository $ecrRepo already exists."
-            fi
-
-            # Login to Docker registry
-            aws ecr get-login-password --region $awsRegion | docker login --username AWS --password-stdin $dockerRegistry
-
-            # Push the Docker images
-            docker image push $dockerRegistry:$dockerImageTag
-            docker image push $dockerRegistry:latest
-        """
+/**
+ * Pushes a locally built image to Amazon ECR.
+ *
+ * dockerECRImagePush(
+ *     image:  env.DOCKER_IMAGE,             // <account>.dkr.ecr.<region>.amazonaws.com/<repo>
+ *     tag:    env.DOCKER_TAG,
+ *     region: 'ap-south-1',
+ *     // optional
+ *     awsCredId: 'awsCred',                 // "AWS Credentials" credential; omit to use the agent's
+ *                                           // IAM role (instance profile / IRSA), which is preferred
+ *     additionalTags: ['latest'],           // must have been created by dockerImageBuild
+ *     createRepo:     false,                // create the ECR repo if missing; prefer managing it in IaC
+ *     tagMutability:  'IMMUTABLE',          // only used with createRepo
+ *     awsCliVersion:  '2.17.0'              // only used if the AWS CLI has to be installed
+ * )
+ *
+ * Returns the pushed image digest reference (image@sha256:...), suitable for pinning deployments.
+ */
+def call(Map config = [:]) {
+    for (key in ['image', 'tag', 'region']) {
+        if (!config[key]) {
+            error "dockerECRImagePush: '${key}' is required"
+        }
     }
+    String image = config.image
+    String registry = image.tokenize('/')[0]
+    if (!(registry ==~ /\d{12}\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com(\.cn)?/)) {
+        error "dockerECRImagePush: '${image}' is not an ECR image (<account>.dkr.ecr.<region>.amazonaws.com/<repo>)"
+    }
+    List tags = ([config.tag] + (config.additionalTags ?: [])).unique()
+    for (t in tags) {
+        if (!Shell.isValidTag(t)) {
+            error "dockerECRImagePush: '${t}' is not a valid image tag"
+        }
+    }
+
+    String awsBin = new Tools(this).ensure('awscli', config.awsCliVersion as String)
+    String digest = ''
+    // Per-build DOCKER_CONFIG keeps the registry token out of the agent user's ~/.docker/config.json.
+    withEnv(["PATH+CI_TOOLS=${awsBin}",
+             "AWS_REGION=${config.region}",
+             "AWS_DEFAULT_REGION=${config.region}",
+             "DOCKER_CONFIG=${pwd(tmp: true)}/docker-config"]) {
+        withAwsCredentials(config.awsCredId as String) {
+            if (config.createRepo) {
+                ensureRepository(image.substring(registry.length() + 1), config.tagMutability ?: 'IMMUTABLE')
+            }
+            try {
+                sh(label: 'ECR login',
+                   script: "aws ecr get-login-password | docker login --username AWS --password-stdin ${Shell.quote(registry)}")
+                for (t in tags) {
+                    sh(label: "Push ${image}:${t}", script: "docker image push ${Shell.quote("${image}:${t}")}")
+                }
+                digest = sh(label: 'Resolve image digest', returnStdout: true, script: """
+                    docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' ${Shell.quote("${image}:${config.tag}")} \\
+                        | grep -F ${Shell.quote("${image}@")} | head -n 1
+                """).trim()
+            } finally {
+                sh(label: 'ECR logout', script: "docker logout ${Shell.quote(registry)} >/dev/null 2>&1 || true")
+            }
+        }
+    }
+    echo "Pushed ${image}:${config.tag} (${digest ?: 'digest unavailable'})"
+    return digest
+}
+
+private void withAwsCredentials(String credId, Closure body) {
+    if (credId) {
+        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: credId]]) {
+            body()
+        }
+    } else {
+        body()
+    }
+}
+
+private void ensureRepository(String repo, String tagMutability) {
+    String q = Shell.quote(repo)
+    sh(label: "Ensure ECR repository ${repo}", script: """
+        if aws ecr describe-repositories --repository-names ${q} >/dev/null 2>&1; then
+            echo "ECR repository exists: "${q}
+        else
+            aws ecr create-repository --repository-name ${q} \\
+                --image-tag-mutability ${Shell.quote(tagMutability)} \\
+                --image-scanning-configuration scanOnPush=true \\
+                --encryption-configuration encryptionType=AES256 >/dev/null
+            echo "Created ECR repository: "${q}
+        fi
+    """)
 }

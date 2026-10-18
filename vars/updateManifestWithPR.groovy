@@ -1,339 +1,140 @@
-#!/usr/bin/env groovy
+import groovy.json.JsonOutput
+import groovy.json.JsonSlurperClassic
+import org.mlkrtk.ci.ManifestUpdater
 
-def call(String manifestRepo, String manifestBranch, String gitCredId, String manifestPath, 
-         String newImageName, String newImageTag, String appRepoCommitId = '', 
-         String prTitle = '', String prBody = '', String ghTokenCredId = '') {
-    
-    script {
-        echo "=== Starting Manifest Update Process ==="
-        echo "Repository: ${manifestRepo}"
-        echo "Branch: ${manifestBranch}"
-        echo "New Image: ${newImageName}:${newImageTag}"
-        echo "App Repo Commit ID: ${appRepoCommitId ?: 'Not provided'}"
-        echo "Manifest Path: ${manifestPath}"
-        echo "GitHub Token Provided: ${ghTokenCredId ? 'Yes' : 'No (PR will not be created)'}"
-        
-        def shortCommit = appRepoCommitId ? appRepoCommitId.substring(0, Math.min(8, appRepoCommitId.length())) : ""
-        def commitInfo = shortCommit ? " (commit: ${shortCommit})" : ""
-        def prTitleValue = prTitle ?: "Update image to ${newImageName}:${newImageTag}${commitInfo}"
-        
-        def prBodyText = "Automated update of image to ${newImageName}:${newImageTag}"
-        if (appRepoCommitId) {
-            prBodyText += "\n\nSource Commit: ${appRepoCommitId}"
-        }
-        prBodyText += "\nJenkins Build: #${BUILD_NUMBER}"
-        def prBodyValue = prBody ?: prBodyText
-        
-        def sanitizedImageName = newImageName.replaceAll('[^a-zA-Z0-9]', '-').replaceAll('-+', '-').toLowerCase()
-        def sanitizedTag = newImageTag.replaceAll('[^a-zA-Z0-9]', '-').replaceAll('-+', '-')
-        def gitBranchName = "jenkins-update-image-${sanitizedTag}"
-        
-        echo "Creating branch: ${gitBranchName}"
-        
-        if (isUnix()) {
-            echo "=== Checking GitHub CLI installation ==="
-            sh '''
-                if ! command -v gh > /dev/null; then
-                    echo "GitHub CLI not found. Installing GitHub CLI..."
-                    
-                        echo "Detected Linux OS. Installing via apt..."
-                        curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
-                        sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
-                        echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
-                        sudo apt update
-                        sudo apt install -y gh
-                    
-                    echo "GitHub CLI installed successfully."
-                else
-                    echo "GitHub CLI is already installed."
-                    gh --version
-                fi
-            '''
-        }
-          
-        echo "=== Checking out manifest repository ==="
-        checkout([
-            $class: 'GitSCM',
-            branches: [[name: "${manifestBranch}"]],
-            extensions: [[$class: 'CleanBeforeCheckout']],
-            userRemoteConfigs: [[
-                credentialsId: "${gitCredId}",
-                url: "${manifestRepo}"
-            ]]
-        ])
-        
-        echo "=== Updating manifest files ==="
-        withEnv([
-            "NEW_IMAGE_NAME=${newImageName}",
-            "NEW_IMAGE_TAG=${newImageTag}",
-            "MANIFEST_PATH=${manifestPath}",
-            "GIT_BRANCH_NAME=${gitBranchName}"
-        ]) {
-            sh '''
-                set -e
-                
-                # Configure Git
-                git config user.name "Jenkins-CI-Bot"
-                git config user.email "jenkins@opqtech.com"
-                
-                NEW_IMAGE="${NEW_IMAGE_NAME}:${NEW_IMAGE_TAG}"
-                
-                echo "Target image: ${NEW_IMAGE}"
-                echo "Manifest path: ${MANIFEST_PATH}"
-                
-                git checkout -b "${GIT_BRANCH_NAME}"
-                echo "Created and checked out branch: ${GIT_BRANCH_NAME}"
-                 
-                if [ -f "${MANIFEST_PATH}" ]; then
-                    MANIFEST_FILES="${MANIFEST_PATH}"
-                    echo "Using single manifest file: ${MANIFEST_FILES}"
-                elif [ -d "${MANIFEST_PATH}" ]; then
-                    echo "Manifest path is a directory. Searching for kustomization.yaml files..."
-                    MANIFEST_FILES=$(find "${MANIFEST_PATH}" -type f -name "kustomization.yaml" | tr '\\n' ' ')
-                else
-                    echo "Manifest path ${MANIFEST_PATH} not found as file or directory."
-                    echo "Searching for kustomization.yaml files in overlay* directories..."
-                    MANIFEST_FILES=$(find . -type f -path "*/overlay*/kustomization.yaml" | head -n 1 | tr '\\n' ' ')
-                    
-                    if [ -z "${MANIFEST_FILES}" ]; then
-                        echo "Searching for any kustomization.yaml files..."
-                        MANIFEST_FILES=$(find . -type f -name "kustomization.yaml" | head -n 1 | tr '\\n' ' ')
-                    fi
-                fi
-                
-                if [ -z "${MANIFEST_FILES}" ]; then
-                    echo "ERROR: No kustomization.yaml files found."
-                    exit 1
-                fi
-                
-                echo "Found manifest files: ${MANIFEST_FILES}"
+/**
+ * GitOps: sets an image tag in kustomization.yaml on a bot branch and opens (or updates) a GitHub pull
+ * request against the target branch. Uses the GitHub REST API, so no `gh` CLI is required.
+ *
+ * updateManifestWithPR(
+ *     repoUrl:   'https://github.com/org/manifests.git',   // github.com or GitHub Enterprise, HTTPS
+ *     branch:    'develop',                                // PR base branch
+ *     gitCredId: 'githubCred',                             // Username with password (password = PAT)
+ *     path:      'develop/tetris/overlays/dev',
+ *     image:     env.DOCKER_IMAGE,
+ *     tag:       env.DOCKER_TAG,
+ *     // optional
+ *     ghTokenCredId: 'githubToken',                        // Secret text PAT for the API;
+ *                                                          // defaults to the gitCredId password
+ *     sourceCommit:  env.GIT_COMMIT,
+ *     prTitle:  '...',
+ *     prBody:   '...',
+ *     prBranch: 'ci/...',                                  // default: ci/<path>/<tag>
+ *     kustomizeImageName: 'tetris',
+ *     gitUserName:  'Jenkins-CI-Bot',
+ *     gitUserEmail: 'jenkins@opqtech.com'
+ * )
+ *
+ * Token permissions: contents read/write and pull requests read/write on the manifest repo.
+ * Returns [changed: boolean, commit: String, branch: String, prUrl: String].
+ */
+def call(Map config = [:]) {
+    ManifestUpdater updater = new ManifestUpdater(this, config)
+    updater.validate('updateManifestWithPR')
+    Map github = githubCoordinates(config.repoUrl as String)
+    if (!github) {
+        error "updateManifestWithPR: cannot derive the GitHub repository from '${config.repoUrl}'"
+    }
+    String prBranch = config.prBranch ?: "ci/${slug(config.path as String)}/${slug(config.tag as String)}"
 
-                UPDATED_FILES=""
-                
-                for MANIFEST_FILE in ${MANIFEST_FILES}; do
-                    if [ ! -f "${MANIFEST_FILE}" ]; then
-                        echo "WARNING: File not found: ${MANIFEST_FILE}"
-                        continue
-                    fi
+    updater.checkoutRepo()
+    if (!updater.applyUpdate()) {
+        echo "Manifests already reference ${config.image}:${config.tag}; no pull request needed."
+        return [changed: false, commit: null, branch: prBranch, prUrl: null]
+    }
+    // The PR branch is bot-owned, so force-pushing is safe and makes re-runs update the existing PR.
+    updater.push(prBranch, true)
+    String commit = updater.head()
 
-                    cp "${MANIFEST_FILE}" "${MANIFEST_FILE}.backup"
-                    
-                    case "${MANIFEST_FILE}" in
-                        *.yaml|*.yml)
-                            echo "Detected YAML file - applying kustomization tag update..."
-                            echo "Before update:"
-                            grep -A 3 "images:" "${MANIFEST_FILE}" || true
-                            
-                            # Update only newTag field in kustomization.yaml (preserve indentation and structure)
-                            sed -i -E "s|^([[:space:]]*newTag:)[[:space:]].*$|\\1 \\"${NEW_IMAGE_TAG}\\"|g" "${MANIFEST_FILE}"
-                            
-                            echo "After update:"
-                            grep -A 3 "images:" "${MANIFEST_FILE}" || true
-                            ;;
-                        *)
-                            echo "Unknown file type, applying generic kustomization pattern..."
-                            sed -i -E "s|^([[:space:]]*newTag:)[[:space:]].*$|\\1 \\"${NEW_IMAGE_TAG}\\"|g" "${MANIFEST_FILE}" || true
-                            ;;
-                    esac
-                    
+    String prUrl = createPullRequest(config, github, prBranch, updater.imageName)
+    echo "Pull request: ${prUrl}"
+    return [changed: true, commit: commit, branch: prBranch, prUrl: prUrl]
+}
 
-                    if ! git diff --quiet "${MANIFEST_FILE}"; then
-                        UPDATED_FILES="${UPDATED_FILES} ${MANIFEST_FILE}"
-                        echo "[SUCCESS] Updated image in ${MANIFEST_FILE}"
-                        echo ""
-                        echo "Changes:"
-                        git diff "${MANIFEST_FILE}" || true
-                        rm -f "${MANIFEST_FILE}.backup"
-                    else
-                        echo "[INFO] No changes detected in ${MANIFEST_FILE}"
+private String createPullRequest(Map config, Map github, String head, String imageName) {
+    String tmp = pwd(tmp: true)
+    String owner = github.repo.tokenize('/')[0]
+    writeFile file: "${tmp}/pr-request.json", text: JsonOutput.toJson([
+        title: config.prTitle ?: "chore(${imageName}): deploy ${config.tag} to ${config.path}",
+        body : config.prBody ?: defaultBody(config),
+        head : head,
+        base : config.branch,
+    ])
 
-                        mv "${MANIFEST_FILE}.backup" "${MANIFEST_FILE}"
-                    fi
-                done
-                
-                
-                if [ -z "${UPDATED_FILES}" ]; then
-                    echo "WARNING: No files were updated."
-                    
-                    # Check if kustomization newTag field exists
-                    if grep -q "newTag:" ${MANIFEST_FILES} 2>/dev/null; then
-                        echo "Kustomization newTag field found in manifests but no updates made."
-                        echo "This might mean the tag already matches: ${NEW_IMAGE_TAG}"
-                    else
-                        echo "ERROR: No newTag field found in kustomization files."
-                        exit 1
-                    fi
-                else
-                    echo "Successfully updated files:"
-                    for file in ${UPDATED_FILES}; do
-                        echo "  - ${file}"
-                    done
-                fi
-            '''
-        }
-        
-        echo "=== Checking for changes to commit ==="
-        def hasChanges = sh(
-            script: '''
-                git add -u *.yaml *.yml 2>/dev/null || true
-                
-                find . -type f \\( -name "*.yaml" -o -name "*.yml" \\) -exec git add {} \\; 2>/dev/null || true
-                
-                if git diff --staged --quiet; then
-                    echo "false"
-                else
-                    echo "true"
-                fi
-            ''',
-            returnStdout: true
-        ).trim() == "true"
-        
-        if (hasChanges) {
-            echo "[SUCCESS] Changes detected. Committing and pushing..."
-            
-            def commitMsg = appRepoCommitId ? 
-                "Update image to ${newImageName}:${newImageTag}\n\nSource commit: ${appRepoCommitId}" :
-                "Update image to ${newImageName}:${newImageTag}"
-            
-            sh """
-                git commit -m "${commitMsg}"
-                echo "[SUCCESS] Changes committed"
-            """
-            
-            withCredentials([usernamePassword(
-                credentialsId: "${gitCredId}",
-                usernameVariable: 'GIT_USERNAME',
-                passwordVariable: 'GIT_PASSWORD'
-            )]) {
-                sh """
-                    set -e
-                    
-                    ORIGINAL_URL=\$(git remote get-url origin)
-                    
-                    REPO_PATH=\$(echo "${manifestRepo}" | sed 's|https\\?://||' | sed 's|.*@||')
-                    
-                    git remote set-url origin "https://\${GIT_USERNAME}:\${GIT_PASSWORD}@\${REPO_PATH}"
-                    
-                    echo "Pushing to branch: ${gitBranchName}"
-                    git push origin ${gitBranchName}
-                    echo "[SUCCESS] Changes pushed successfully"
-                    
-                    # Restore original remote URL
-                    git remote set-url origin "\${ORIGINAL_URL}"
-                """
-            }
-            
-            if (ghTokenCredId) {
-                echo "=== Creating Pull Request ==="
-                
-                withCredentials([string(credentialsId: "${ghTokenCredId}", variable: 'GH_TOKEN')]) {
-                    sh """
-                        set -e
-                        
-                        echo "Authenticating with GitHub..."
-                        echo "[INFO] Using GH_TOKEN environment variable for authentication"
-                        
-                        if gh auth status 2>&1 | grep -q "Logged in"; then
-                            echo "[SUCCESS] GitHub CLI authenticated successfully"
-                        else
-                            echo "[INFO] GitHub CLI will use GH_TOKEN from environment"
-                        fi
-                        
-                        REPO_URL=\$(echo "${manifestRepo}" | sed 's|.*github.com[:/]||' | sed 's|\\.git\$||')
-                        echo "Repository: \${REPO_URL}"
-                        echo "Base branch: ${manifestBranch}"
-                        echo "Head branch: ${gitBranchName}"
-                        echo "PR Title: ${prTitleValue}"
-                        
-                        echo "Verifying remote branch exists..."
-                        if git ls-remote --heads origin "${gitBranchName}" | grep -q "${gitBranchName}"; then
-                            echo "[SUCCESS] Branch ${gitBranchName} exists on remote"
-                        else
-                            echo "[ERROR] Branch ${gitBranchName} not found on remote"
-                            echo "Available branches:"
-                            git ls-remote --heads origin | head -10
-                            exit 1
-                        fi
-                        
-                        echo "Verifying base branch exists..."
-                        if git ls-remote --heads origin "${manifestBranch}" | grep -q "${manifestBranch}"; then
-                            echo "[SUCCESS] Base branch ${manifestBranch} exists"
-                        else
-                            echo "[ERROR] Base branch ${manifestBranch} not found on remote"
-                            echo "Available branches:"
-                            git ls-remote --heads origin | head -10
-                            exit 1
-                        fi
-                        
-                        set +e
-                        gh pr create \\
-                            --repo "\${REPO_URL}" \\
-                            --title "${prTitleValue}" \\
-                            --body "${prBodyValue}" \\
-                            --base "${manifestBranch}" \\
-                            --head "${gitBranchName}" 2>&1
-                        PR_CREATE_EXIT_CODE=\$?
-                        set -e
-                        
-                        if [ \${PR_CREATE_EXIT_CODE} -eq 0 ]; then
-                            echo ""
-                            echo "[SUCCESS] Pull request created successfully!"
-                        else
-                            echo ""
-                            echo "[WARNING] PR creation failed with exit code: \${PR_CREATE_EXIT_CODE}"
-                            echo "Checking if PR already exists..."
-                            
-                            set +e
-                            EXISTING_PR=\$(gh pr list --repo "\${REPO_URL}" --head "${gitBranchName}" --json number --jq '.[0].number' 2>/dev/null)
-                            LIST_EXIT_CODE=\$?
-                            set -e
-                            
-                            if [ \${LIST_EXIT_CODE} -eq 0 ] && [ -n "\${EXISTING_PR}" ] && [ "\${EXISTING_PR}" != "null" ]; then
-                                echo "[INFO] PR #\${EXISTING_PR} already exists for branch ${gitBranchName}"
-                                echo "PR URL: https://github.com/\${REPO_URL}/pull/\${EXISTING_PR}"
-                                echo "[SUCCESS] Using existing pull request"
-                            else
-                                echo ""
-                                echo "=========================================="
-                                echo "ERROR: Failed to create PR"
-                                echo "=========================================="
-                                echo "Exit code: \${PR_CREATE_EXIT_CODE}"
-                                echo ""
-                                echo "Possible reasons:"
-                                echo "  1. A PR already exists but couldn't be detected"
-                                echo "  2. Insufficient GitHub token permissions (needs 'repo' scope)"
-                                echo "  3. Repository settings may prevent PR creation"
-                                echo "  4. Branch protection rules may be blocking"
-                                echo ""
-                                echo "Debug information:"
-                                echo "  Repository: \${REPO_URL}"
-                                echo "  Base branch: ${manifestBranch}"
-                                echo "  Head branch: ${gitBranchName}"
-                                echo ""
-                                echo "You can manually create the PR at:"
-                                echo "  https://github.com/\${REPO_URL}/compare/${manifestBranch}...${gitBranchName}"
-                                exit 1
-                            fi
-                        fi
-                        
-                        echo ""
-                        echo "Logging out from GitHub CLI..."
-                        gh auth logout --hostname github.com 2>/dev/null || true
-                        echo "[INFO] PR creation process completed"
-                    """
+    def tokenBinding = config.ghTokenCredId ?
+        string(credentialsId: config.ghTokenCredId, variable: 'GH_TOKEN') :
+        usernamePassword(credentialsId: config.gitCredId, usernameVariable: 'GH_USER', passwordVariable: 'GH_TOKEN')
+
+    String prUrl = null
+    withCredentials([tokenBinding]) {
+        withEnv(["PULLS_API=${github.api}/repos/${github.repo}/pulls",
+                 "PR_HEAD=${owner}:${head}",
+                 "TMP_DIR=${tmp}"]) {
+            // The token is fed to curl through --config on stdin so it never shows up in process arguments.
+            String status = sh(label: 'Create pull request', returnStdout: true, script: '''
+                set -eu
+                printf 'header = "Authorization: Bearer %s"\\n' "$GH_TOKEN" | curl -sS --retry 3 --config - \\
+                    -X POST -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' \\
+                    -o "$TMP_DIR/pr-response.json" -w '%{http_code}' \\
+                    --data @"$TMP_DIR/pr-request.json" "$PULLS_API"
+            ''').trim()
+
+            if (status == '201') {
+                prUrl = parseJson(readFile("${tmp}/pr-response.json")).html_url
+                echo "Created pull request ${prUrl}"
+            } else if (status == '422') {
+                // Typically "A pull request already exists"; the force-push above has already updated it.
+                sh(label: 'Find existing pull request', script: '''
+                    set -eu
+                    printf 'header = "Authorization: Bearer %s"\\n' "$GH_TOKEN" | curl -fsS --retry 3 --config - -G \\
+                        -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' \\
+                        --data-urlencode "head=$PR_HEAD" --data-urlencode 'state=open' \\
+                        -o "$TMP_DIR/pr-list.json" "$PULLS_API"
+                ''')
+                List open = parseJson(readFile("${tmp}/pr-list.json")) as List
+                if (!open) {
+                    error "GitHub rejected the pull request (HTTP 422): ${readFile("${tmp}/pr-response.json")}"
                 }
+                prUrl = open[0].html_url
+                echo "Updated existing pull request ${prUrl}"
             } else {
-                echo "[WARNING] GitHub token not provided. Skipping PR creation."
-                echo "Changes have been pushed to branch: ${gitBranchName}"
-                echo "Please create the PR manually."
+                error "GitHub API returned HTTP ${status} creating the pull request: ${readFile("${tmp}/pr-response.json")}"
             }
-            
-            echo "=== Manifest Update Process Completed Successfully ==="
-            
-        } else {
-            echo "[INFO] No changes to commit."
-            echo "Image might already be set to ${newImageName}:${newImageTag}"
-            echo "=== Process completed with no changes ==="
         }
     }
+    return prUrl
+}
+
+private String defaultBody(Map config) {
+    List rows = ["| Image | `${config.image}:${config.tag}` |",
+                 "| Path | `${config.path}` |"]
+    if (config.sourceCommit) {
+        rows << "| Source commit | `${config.sourceCommit}` |"
+    }
+    if (env.BUILD_URL) {
+        rows << "| Jenkins build | [${env.JOB_NAME} #${env.BUILD_NUMBER}](${env.BUILD_URL}) |"
+    }
+    return (['Automated image update from Jenkins.', '', '| | |', '|---|---|'] + rows).join('\n')
+}
+
+/** https://github.com/org/repo(.git) -> [api: 'https://api.github.com', repo: 'org/repo']; GHES uses /api/v3. */
+@NonCPS
+private static Map githubCoordinates(String repoUrl) {
+    def m = repoUrl =~ /^https:\/\/(?:[^@\/]+@)?([^\/:]+)\/([^\/]+\/[^\/]+?)(?:\.git)?\/?$/
+    if (!m.matches()) {
+        return null
+    }
+    String host = m.group(1)
+    return [api : host == 'github.com' ? 'https://api.github.com' : "https://${host}/api/v3".toString(),
+            repo: m.group(2)]
+}
+
+@NonCPS
+private static String slug(String value) {
+    return value.replaceAll('[^A-Za-z0-9._-]+', '-').replaceAll('^-+|-+$', '')
+}
+
+@NonCPS
+private static Object parseJson(String text) {
+    return new JsonSlurperClassic().parseText(text)
 }

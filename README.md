@@ -58,3 +58,29 @@ This repo consists of groovy scripts, used to continously integrate and continou
 > Shell --> Uses only shell commands with piplenine declarative synatx
 
 > Script --> Uses script block to perform various operations
+
+---
+
+## Build, scan, push and GitOps steps (v2 API)
+
+`dockerImageBuild`, `snykCodeScan`, `snykImageScan`, `dockerECRImagePush`, `updateManifest` and
+`updateManifestWithPR` take a single map of named arguments. Each file's header documents every
+option. See [examples/Jenkinsfile](examples/Jenkinsfile) for a complete pipeline.
+
+```groovy
+dockerImageBuild(image: env.DOCKER_IMAGE, tag: env.DOCKER_TAG)
+snykImageScan(image: env.DOCKER_IMAGE, tag: env.DOCKER_TAG, snykCredId: 'snykCred', snykOrg: env.SNYK_ORG)
+dockerECRImagePush(image: env.DOCKER_IMAGE, tag: env.DOCKER_TAG, region: 'ap-south-1', awsCredId: 'awsCred')
+updateManifestWithPR(repoUrl: '...', branch: 'develop', gitCredId: 'githubCred', path: 'overlays/dev',
+                     image: env.DOCKER_IMAGE, tag: env.DOCKER_TAG, sourceCommit: env.GIT_COMMIT)
+```
+
+Layout:
+
+- `vars/` – pipeline steps
+- `src/org/mlkrtk/ci/` – shared helpers (shell quoting, tool install, Snyk runner, manifest updater)
+- `resources/org/mlkrtk/ci/` – shell scripts loaded with `libraryResource`
+
+Agent requirements: Linux, Docker, git, curl, bash. The Snyk and AWS CLIs are used from `PATH` if they
+are present. Otherwise they are installed without sudo into `~/.cache/ci-tools` (the Snyk download is
+checksum-verified). Installing the AWS CLI also needs `unzip`.
